@@ -1,0 +1,32 @@
+=== 内存六区地址 ===
+.text  (代码段)   : 00007FF78C8E1000  (函数 text_marker)
+.rdata (只读数据) : 00007FF78C8F7408  (字符串字面量)
+.data  (已初始化) : 00007FF78C902000  (g_data_var)
+.bss   (未初始化) : 00007FF78C902B90  (g_bss_var)
+.data  (指针变量) : 00007FF78C902008  (g_msg_ptr 本身，在 .data)
+    -> g_msg_ptr 指向的字符串在 .rdata: 00007FF78C8F7330
+栈 (.stack)      : 000000544ACFFB0C  (main 局部 stack_local)
+
+=== 堆单调性自检（连续 5 次 new）===
+  new #0 -> 00000167438DE6A0
+  new #1 -> 00000167438DE680
+  new #2 -> 00000167438DE780
+  new #3 -> 00000167438DE7E0
+  new #4 -> 00000167438DE7F0
+结论：地址严格递增？ 否（正常！空闲块复用+分级 bin 导致，解释它而非记结论）
+
+=== 递归探栈（4 层）===
+  [recurse depth=4] &local = 000000544ACFFAC0
+  [recurse depth=3] &local = 000000544ACFFA80
+    -> 上一层 &local = 000000544ACFFAC0  (本层更小? 是)
+  [recurse depth=2] &local = 000000544ACFFA40
+    -> 上一层 &local = 000000544ACFFA80  (本层更小? 是)
+  [recurse depth=1] &local = 000000544ACFFA00
+    -> 上一层 &local = 000000544ACFFA40  (本层更小? 是)
+  [recurse depth=0] &local = 000000544ACFF9C0
+    -> 上一层 &local = 000000544ACFFA00  (本层更小? 是)
+
+=== 验收三问（写进日报）===
+1) 栈为何向低地址增长？（push 让 rsp 递减，是 ABI 约定+历史设计）
+2) 堆为何不一定递增？（分配器策略，不是保证）
+3) 绝对高低由谁决定？（ASLR 随机化，每次启动都变，我不记结论）

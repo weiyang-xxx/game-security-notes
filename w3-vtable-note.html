@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>W3 · 虚表与对象内存布局全景 | 韦扬</title>
+<style>
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body { max-width: 860px; margin: 0 auto; padding: 32px 20px 80px;
+       font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+       line-height: 1.75; color: #1f2328; background: #fff; }
+h1 { font-size: 28px; border-bottom: 3px solid #0969da; padding-bottom: 8px; }
+h2 { font-size: 22px; margin-top: 36px; border-left: 5px solid #0969da; padding-left: 10px; }
+h3 { font-size: 18px; margin-top: 24px; color: #0969da; }
+p { margin: 12px 0; }
+code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px;
+       font-family: "Cascadia Code", Consolas, monospace; font-size: 14px; }
+pre { background: #0d1117; color: #e6edf3; padding: 16px; border-radius: 8px;
+      overflow-x: auto; }
+pre code { background: none; padding: 0; color: #e6edf3; }
+blockquote { background: #f6f8fa; border-left: 4px solid #d0d7de;
+             margin: 12px 0; padding: 8px 16px; color: #57606a; }
+table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14px; }
+th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; }
+th { background: #f6f8fa; }
+hr { border: none; border-top: 1px solid #d0d7de; margin: 28px 0; }
+</style>
+</head>
+<body>
+<h1>W3 公开笔记 · 虚表与对象内存布局全景</h1>
+<blockquote>学员：韦扬 ｜ 阶段：S1（W1–W12）C++ 内存模型 + Windows 进程/内存 ｜ 周期：2026-09-13 ~ 2026-09-16 性质：W3D4 收口笔记，把 D1（单继承 vptr）/ D2（多继承双 vptr）/ D3（虚表三连）三份证据串成一张「任意 C++ 对象布局全图」。 验收：三节齐全 + 三张自画布局图 + 数字与 MSVC 实测一致。</blockquote>
+<hr>
+<h2>一句话</h2>
+<p>W3 你从 W2「能算死的偏移」升级到「能看懂活的对象布局」：对象头里塞一个 <strong>vptr</strong> 指向一张 <strong>vtable</strong>；多继承下变出<strong>双 vptr + this 调整</strong>；虚表自己躺在<strong>只读段 <code>.rdata</code></strong>。这篇把三天证据钉成一张全图，并接回 W1 的进程内存四区图。</p>
+<hr>
+<h2>1. 单继承：一个 vptr 指向一张 vtable</h2>
+<p><strong>直觉</strong>：带虚函数的类，编译器在对象头部（offset 0）自动塞 8 字节指针（vptr），指向一张「虚函数跳转表」（vtable）。vtable 是只读（<code>.rdata</code>）的函数指针数组，按虚函数声明顺序排，全类共享一份。</p>
+<p><strong>虚调用四步</strong>（x64）：</p>
+<p>1. 读对象头 8 字节 → 拿到 vptr</p>
+<p>2. 跳到 vptr 指向的 vtable</p>
+<p>3. 按虚函数声明顺序按下标取 slot（如 <code>foo</code> 是 slot 0）</p>
+<p>4. <code>call</code> 该地址，并把 <code>this</code> 作隐藏参数走 <code>rcx</code></p>
+<p><strong>大小怎么来的</strong>（你亲手实测，曾纠正导师错值）：</p>
+<p>- <code>sizeof(Base)=16</code> = vptr(8) + x(4) + 尾部 padding(4)（最大对齐值 8 的倍数）</p>
+<p>- <code>sizeof(Derived)=24</code> = <strong>Base 子对象整块(16)</strong> + y@16(4) + 尾部 padding(4)</p>
+<blockquote>⚠️ <strong>关键坑（D1 实测）</strong>：基类子对象在派生类里是<strong>整块搬运</strong>，其尾部 padding <strong>不能被</strong>派生类新成员复用。导师曾误算成 Derived=16/y@12，你实测证明 <strong>24/y@16 才对</strong>。</blockquote>
+<p><strong>手动经 vptr 调虚函数</strong>（D1 核心动手，已跑通）：</p>
+<pre><code>typedef void(*VFunc)(Base*);
+VFunc f = (VFunc)vtable[0];
+printf("manual: "); f(&amp;b);   // 输出与 b.foo() 一字不差</code></pre>
+<p><strong>布局图（单继承）</strong>：</p>
+<pre><code>offset 0  : [vptr 8B][x 4B][pad 4B]     &lt;- Base 子对象 16B
+offset 16 : [y 4B][pad 4B]              &lt;- Derived 自己的 8B
+总 24 字节</code></pre>
+<hr>
+<h2>2. 多继承：双 vptr + 双 vtable + this 调整</h2>
+<p><strong>直觉</strong>：<code>C : A, B</code>（A、B 都有虚函数）时，外部代码可能拿 <code>A*</code>（把 C 当 A）或 <code>B*</code>（把 C 当 B）。C++ 保证两种视角都像纯正的基类，但 A、B 的虚表内容不同，无法合成一张。于是编译器让 C 背着<strong>两个 vptr</strong>：</p>
+<p>- A 是主基类摆最前，vptrA @ <strong>offset 0</strong></p>
+<p>- B 子对象 @ <strong>offset 16</strong>，vptrB @ <strong>offset 16</strong></p>
+<p><strong>this 调整（最反直觉）</strong>：<code>B* bp = &amp;c;</code> 时 <code>bp</code> 指向 B 子对象开头（offset 16），不是整个 C 开头（offset 0）。所以经 vptrB 手动调虚函数，<strong>this 必须传 <code>(char*)&amp;c + 16</code></strong>——传错就读到错位内存的垃圾。</p>
+<p><strong>MSVC 铁证</strong>（<code>cl /d1reportSingleClassLayoutC</code>）：</p>
+<p>- 两个 <code>vftable</code> 块</p>
+<p>- 第二个（B 的）<code>offset-to-top = -16</code>（负数 = this 调整的机器级证据）</p>
+<p>- <code>this adjustor: a=0, b=16</code></p>
+<p><strong>手动调</strong>（D2 核心动手，已跑通）：</p>
+<pre><code>fa((void*)&amp;c);            // 经 A 的 vptr，this=&amp;c（offset 0）
+fb((char*)&amp;c + 16);       // 经 B 的 vptr，this= B 子对象起点（offset 16）</code></pre>
+<p><strong>布局图（多继承 C : A, B）</strong>：</p>
+<pre><code>offset 0  : [A-vptr 8B][A::x 4B][pad 4B]     &lt;- A 子对象 16B
+offset 16 : [B-vptr 8B][B::y 4B][pad 4B]     &lt;- B 子对象 16B，第二个 vptr 在这！
+offset 32 : [C::z 4B][pad 4B]
+总 40 字节</code></pre>
+<blockquote>注意：B 的 vptr 在 <strong>offset 16，不是 8</strong>（前面整块 A 子对象占了 16 字节）。</blockquote>
+<hr>
+<h2>3. 虚表三连（接回 W1 进程内存四区图）</h2>
+<h3>3.1 基类析构必须 virtual（否则派生部分泄漏）</h3>
+<p>同一个 <code>BaseA* p = new DerivedA(); delete p;</code>，只改 <code>~BaseA</code> 是否 virtual：</p>
+<table>
+<thead><tr><th><code>~BaseA</code></th><th>输出</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td><strong>非</strong> virtual</td><td>只有 <code>~BaseA</code></td><td><code>~DerivedA</code> 没跑 → <code>DerivedA::buf</code> 那块堆<strong>泄漏（UB）</strong></td></tr>
+<tr><td><strong>virtual</strong></td><td>先 <code>~DerivedA (frees buf)</code> 再 <code>~BaseA</code></td><td>派生析构先收口，基类收尾 → 干净</td></tr>
+</tbody></table>
+<p><strong>机制</strong>：<code>delete</code> 经基类指针时，非 virtual 只静态调 <code>~BaseA</code>（看指针表面类型），不知道底下压着 Derived 层。</p>
+<p><strong>游戏安全落点</strong>：逆向认一个类，必须顺着继承链查每层析构是否 virtual——有大量 <code>Base*</code> 指向的基类，析构不 virtual 就会在「经基类指针删除」处悄悄漏掉派生资源。</p>
+<h3>3.2 构造/析构中调虚函数不多态</h3>
+<p>在 <code>BaseB::BaseB()</code> 构造体里加 <code>foo();</code>，再 <code>DerivedB d;</code>：</p>
+<pre><code>BaseB::foo        &lt;- 构造期间调用，走的是【基类版】！（非 DerivedB::foo）</code></pre>
+<p><strong>机制</strong>：vptr 是<strong>逐层盖楼</strong>设的——基类构造先把 vptr 指基类表，基类构造跑完、派生构造才覆盖成派生表。所以 <code>BaseB</code> 构造体执行那一刻，vptr 还在基类表上。析构对称、方向相反。</p>
+<p><strong>游戏安全落点</strong>：反汇编里看到构造函数内的虚调用，<strong>别假设跳最终派生版</strong>，它只跳「当前正在构造那一层」的版本。</p>
+<h3>3.3 vtable 落在 <code>.rdata</code>（只读数据段）</h3>
+<p>区分两个常被混淆的东西：</p>
+<p>- <strong>vtable（虚表）</strong>：编译器给<strong>每个类</strong>生成的<strong>全局唯一、只读</strong>函数指针表 → 存在 <code>.rdata</code></p>
+<p>- <strong>vptr（虚指针）</strong>：<strong>每个对象头里</strong>那 8 字节，指向自己类的 vtable → 随对象存在栈/堆上</p>
+<p><strong>D3 实测四地址（本机 MSVC）</strong>：</p>
+<table>
+<thead><tr><th>符号</th><th>地址</th><th>所属段</th></tr></thead>
+<tbody>
+<tr><td><strong>vtable addr</strong></td><td><code>00007FF616E49570</code></td><td><strong><code>.rdata</code>（只读）</strong></td></tr>
+<tr><td>string literal addr</td><td><code>00007FF616E493F8</code></td><td><code>.rdata</code></td></tr>
+<tr><td>global <code>g_x</code> addr</td><td><code>00007FF616E55C00</code></td><td><code>.data</code></td></tr>
+<tr><td><code>free_fun</code> addr</td><td><code>00007FF616E31000</code></td><td><code>.text</code></td></tr>
+</tbody></table>
+<p><strong>关键点</strong>：vtable 与字符串字面量地址只差 <strong>0x178（376 字节）</strong>——同一片内存、同属 <code>.rdata</code>，远离栈（高地址）与堆。</p>
+<p><strong>为什么放只读段</strong>：vtable 是虚函数跳转表，只要有人改写表里任一函数指针，所有经该 vptr 的虚调用就被劫持——这正是 <strong>vtable hijack 攻击</strong>与 S4 vtable hook 的攻击面。编译器放 <code>.rdata</code>，从段权限层面禁止改写。</p>
+<p><strong>接回 W1</strong>：vtable 落在 W1 进程内存分区图的 <strong><code>.rdata</code>（静态只读数据区）</strong>，与字符串字面量同片；W3 虚表图由此拼进 W1 内存全景图。</p>
+<hr>
+<h2>全图总结（周日周会要能脱稿讲清 + 手绘）</h2>
+<p>任意 C++ 对象布局 = <strong>各基类子对象（含各自 vptr）从 offset 0 依次堆叠 + 派生自有成员</strong>；</p>
+<p>- vptr 在各自子对象头，指向 <code>.rdata</code> 里的 vtable；</p>
+<p>- 多继承下第二个基类子对象有<strong>独立 vptr</strong> 且调用时 <strong>this 要 +offset</strong>；</p>
+<p>- 基类析构<strong>必须 virtual</strong> 防派生部分泄漏；</p>
+<p>- 构造/析构期虚调用<strong>不多态</strong>（vptr 逐层盖楼）。</p>
+<p>把这三把尺子和 W1 四区图拼在一起，W3 虚表这一关就真收口了。</p>
+</body>
+</html>

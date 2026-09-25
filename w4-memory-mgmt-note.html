@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>W4 · 堆内存管理全景 | 韦扬</title>
+<style>
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body { max-width: 860px; margin: 0 auto; padding: 32px 20px 80px;
+       font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+       line-height: 1.75; color: #1f2328; background: #fff; }
+h1 { font-size: 28px; border-bottom: 3px solid #0969da; padding-bottom: 8px; }
+h2 { font-size: 22px; margin-top: 36px; border-left: 5px solid #0969da; padding-left: 10px; }
+h3 { font-size: 18px; margin-top: 24px; color: #0969da; }
+p { margin: 12px 0; }
+code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px;
+       font-family: "Cascadia Code", Consolas, monospace; font-size: 14px; }
+pre { background: #0d1117; color: #e6edf3; padding: 16px; border-radius: 8px;
+      overflow-x: auto; }
+pre code { background: none; padding: 0; color: #e6edf3; }
+blockquote { background: #f6f8fa; border-left: 4px solid #d0d7de;
+             margin: 12px 0; padding: 8px 16px; color: #57606a; }
+table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14px; }
+th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; }
+th { background: #f6f8fa; }
+hr { border: none; border-top: 1px solid #d0d7de; margin: 28px 0; }
+img { max-width: 100%; border: 1px solid #d0d7de; border-radius: 6px; margin: 8px 0; display: block; }
+</style>
+</head>
+<body>
+<h1>W4 公开笔记 · 把 C++ 堆内存管理这把刀磨利</h1>
+<blockquote>学员：韦扬 ｜ 阶段：S1（W1–W12）C++ 内存模型 + Windows 进程/内存 ｜ 周期：2026-09-21 ~ 2026-09-25 性质：W4D4 收口笔记，把 D1（堆泄漏）/ D2（数组与 placement new）/ D3（RAII 与智能指针）串成一条「释放责任演进线」。 验收：四节齐全 + 数组头/逆序析构布局图 + 4 张实锤截图 + 口述全过。</blockquote>
+<hr>
+<h2>0. 一句话先给结论</h2>
+<p><strong>事实</strong>：C++ 堆内存管理是一条「释放责任」的演进线——从 D1 的裸 <code>new/delete</code>（靠人记得还，会漏），到 D2 的 <code>new[]/delete[]</code> 配对（配错直接炸），再到 D3 的 RAII 智能指针（把「还资源」焊死在对象析构上，编译器 100% 保证执行）。三天练的不是三个孤立知识点，而是同一件事越做越稳。</p>
+<p><strong>我的话</strong>（你 D3 口述原话，可直接用）：裸指针的 <code>delete</code> 在提前 return 和抛异常时会被跳过——不管你是正常跑完、中途 return、还是中间炸异常，<strong>栈对象一出作用域，析构 100% 跑</strong>。把「释放资源」从「你记得在某条分支里手动调」变成「编译器保证在出口执行」。</p>
+<hr>
+<h2>1. 栈 vs 堆（为什么要有堆）</h2>
+<p><strong>事实</strong>：程序跑起来，内存大致分几个区（D1 实测地址量级）：栈 ≈ 825GB、堆 ≈ 2.85TB、模块（代码/静态区）≈ 140TB。栈上的变量「函数一返回就没了」，由编译器自动分配/回收，速度快但<strong>生命周期被作用域绑死</strong>、空间也有限；堆上的变量是你自己 <code>new</code> 出来的，<strong>能活过创建它的函数</strong>，寿命由你控制，但「还」这件事得你自己（或 RAII）负责，管不好就漏。</p>
+<p><strong>我的话</strong>（你 D4 填的原话）：栈变量 = 你去图书馆自习，前台给你一个临时座位。你坐下把书放桌上（局部变量）。一起身离开（函数返回），管理员立刻把桌子清空，书直接扔了。你再想回去拿那本书（返回局部变量地址），桌上可能已经坐了别人，书早没了。堆变量 = 你租了个私人储物柜。把东西放进去然后离开图书馆（函数返回），柜子还是你的、东西还在，只要不退租（free）。但钥匙（指针）弄丢了，柜子就永远锁着、别人用不了你也拿不回——这就是内存泄漏。</p>
+<hr>
+<h2>2. new/delete 与泄漏（D1）</h2>
+<p><strong>事实</strong>：</p>
+<p>- <code>new T(args)</code> = ①向堆申请一块够大的内存 ②在那块内存上调构造函数初始化。<code>delete p</code> = ①调析构函数 ②把内存还回堆。两步顺序正好反过来。</p>
+<p>- <strong>泄漏</strong> = <code>new</code> 了但忘了 <code>delete</code>：内存一直被你占着、没人还，程序跑久了就越占越多。</p>
+<p>- <strong>怎么抓泄漏（Windows / MSVC Debug 版）</strong>：<code>_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF)</code> 让程序退出时自动清点；也可以手动调 <code>_CrtDumpMemoryLeaks()</code>。关键坑：CRT 默认把报告发到 <code>OutputDebugString</code>，<strong>在 cmd 里直跑 exe 看不到</strong>，必须把报告模式改道 stderr（<code>_CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_DEBUG | _CRTDBG_MODE_FILE)</code> + <code>_CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR)</code>）。报告里 <code>Data: 01 00 00 00</code> 这种小端字节，就是 <code>hp=1</code>，能直接读出漏的是哪个对象。</p>
+<p><strong>我的话</strong>（你 D3 口述原话，可直接用）：裸指针的 <code>delete</code> 在<strong>提前 return 和抛异常时会被跳过</strong>。你今天 Part A 就是提前 return 漏的——代码里 <code>return;</code> 一跳，后面的 <code>delete</code> 根本没机会执行。这就是「靠小心」不靠谱的地方：分支一多、一抛异常，人写的 <code>delete</code> 就被绕过去了。</p>
+<p><img src="notes/w4-d1-leak.png" alt="D1 堆泄漏报告：12 字节 / Data 64 00 00 00 = hp=100"></p>
+<blockquote>小注：这张是<strong>修好「报告能不能看见」之后、还没修「报告打两遍」之前</strong>的输出——所以 <code>Detected memory leaks!</code> 出现了两次（<code>_CRTDBG_LEAK_CHECK_DF</code> 自动 dump 一次 + 显式 <code>_CrtDumpMemoryLeaks()</code> 又一次）。只留一个 dump 源之后就只剩一份了。留着这张图是提醒自己：<strong>排障是逐个坑拔的</strong>，先把"看不见"修成"看得见"，再修"看得见但重复"。</blockquote>
+<hr>
+<h2>3. 数组 new[]/delete[] 与配对（D2）</h2>
+<p><strong>事实</strong>：</p>
+<p>- <code>new T[n]</code> 不是只申请 <code>n*sizeof(T)</code> 字节，编译器会在对象数组<strong>前面偷偷加一个「数组头」存 count（元素个数）</strong>。<code>delete[]</code> 时：读头 → <strong>逆序</strong>从最后一个元素往前调 <code>n</code> 次析构 → 把整块（含头）一起释放。</p>
+<p>- <strong>配错</strong> = 用 <code>new T[n]</code> 配 <code>delete p</code>（少了 <code>[]</code>）：不读数组头 → 只调 <strong>1 次</strong>析构 + 释放尺寸算错 → <strong>未定义行为（UB），直接崩</strong>。配错比漏更阴间：漏只是慢慢占内存，配错当场炸。</p>
+<p>- <strong>placement new</strong> <code>new(addr) T(args)</code>：不在堆上新申请内存，而是在你<strong>已有的</strong>一块内存（比如栈上 <code>char buffer[sizeof(T)]</code>）上直接构造对象。它没有「分配」动作，所以<strong>必须手写 <code>p-&gt;~T()</code> 收尾，而且绝不可 <code>delete p</code></strong>（那块内存不是它分配的）。栈 buffer 还要 <code>alignas(T)</code> 对齐，否则在没对齐的地址上构造会出问题。</p>
+<p><strong>我的话</strong>（你 D2 口述原话，可直接用）：<code>delete</code>（配错）只删第一个对象就出问题，程序崩溃。placement new 是在已有内存上建的，拆掉它得自己手写析构函数 <code>~T()</code>，而且不能去 <code>delete</code> 那个指针——那内存本来就不是它申请的。</p>
+<p><strong>布局图（ASCII，照 D2 实测画）</strong>：</p>
+<pre><code>new Player[3] 的内存布局（每个 Player = hp,x,y 三个 int = 12 字节）：
++------------+-----------+-----------+-----------+
+| 数组头     |  P0       |  P1       |  P2       |
+| count = 3  | hp,x,y    | hp,x,y    | hp,x,y    |
++------------+-----------+-----------+-----------+
+     ↑ 编译器偷偷加的，delete[] 靠它知道要析几遍
+
+delete[] 时（逆序析构）：
+  先 P2.~Player()  →  再 P1.~Player()  →  再 P0.~Player()  →  释放整块(含头)
+  （顺序反过来：P2 → P1 → P0）
+
+错配 delete arr（惨案）：
+  不读数组头 → 只调 1 次析构(P0) → 释放尺寸算错 → UB / 崩溃</code></pre>
+<p><strong>贴图 ①（正确配对，看逆序析构）</strong>：</p>
+<p><img src="notes/w4-d2-array.png" alt="D2 数组：ctor 1/2/3 → dtor 3/2/1 + placement new 手写析构"></p>
+<p><code>new Player[3]</code> → ctor hp=1/2/3（正序构造）；<code>delete[]</code> → dtor hp=3/2/1（<strong>逆序</strong>）——<code>delete[]</code> 从尾到头逐个析构，这就是和 vector 正序相反的那套约定。图下半截 <code>Part C: placement new</code> 里 <code>Player hp=100, x=5, y=5</code> 后面紧跟一句 <code>Player dtor hp=100</code>，那是我手写的 <code>p-&gt;~Player()</code>，<strong>placement new 的对象必须自己动手拆，编译器不会管</strong>。</p>
+<p><strong>贴图 ②（错配 delete 而非 delete[]，实测 UB）</strong>：</p>
+<p><img src="notes/w4-d2-mismatch.png" alt="D2 错配：三个对象 ctor 10/20/30 只析构第一个就崩"></p>
+<p>三个对象全造出来了（ctor hp=10/20/30、print 全打），但 <code>delete arr</code> 只给了 <code>Player dtor hp=10</code> <strong>一次</strong>——不读数组头、不逐个析构、还按单对象尺寸去还整块，接下来程序崩（图中输出到此截断）。<code>new[]</code> 必须配 <code>delete[]</code>，这就是活证据。</p>
+<hr>
+<h2>4. RAII 与智能指针（D3）</h2>
+<p><strong>事实</strong>：</p>
+<p>- <strong>RAII</strong>（Resource Acquisition Is Initialization）：资源获取即初始化——把「管一个资源」包进一个<strong>对象</strong>，资源在构造时拿到、在析构时还。对象一出作用域（不管正常返回、提前 return、还是抛异常），析构 100% 跑，等于把「还资源」焊死在编译器保证的路径上。</p>
+<p>- <code>std::unique_ptr&lt;T&gt;</code>：<strong>独占</strong>一个堆对象，本身是栈上的智能指针对象；它析构时自动 <code>delete</code> 里面的裸指针。所以提前 <code>return</code> 也不漏——栈上的 <code>unique_ptr</code> 退出作用域就析构，顺手把堆对象还了。</p>
+<p>- <code>std::vector&lt;T&gt;</code>：内部自己管一个 <code>new[]</code> 出来的堆数组，析构时自动 <code>delete[]</code> 所有元素。它让你<strong>彻底告别手写 <code>new[]/delete[]</code></strong>。</p>
+<p>- <strong>重点</strong>：<code>unique_ptr</code> / <code>vector</code> 底层<strong>还是堆</strong>，所以 D1/D2 学的「堆 / 泄漏 / 数组头 / 逆序析构」没白学——你只是把「手动还」升级成「编译器替你还」，但对象到底在堆上、怎么析构，那些底层知识照常管用。</p>
+<p><strong>我的话</strong>（你 D3 口述原话，可直接用）：RAII 真正厉害的地方是：不管你是正常跑完、中途 return、还是中间炸异常，<strong>栈对象一出作用域，析构 100% 跑</strong>。把「释放资源」从「你记得在某条分支里手动调」变成「编译器保证在出口执行」。提前 return 和抛异常会跳过裸指针的 <code>delete</code>，但跳不过栈对象的析构。</p>
+<p><strong>对比表</strong>：</p>
+<table>
+<thead><tr><th>写法</th><th>提前 return 会漏吗</th><th>底层</th><th>谁负责还</th></tr></thead>
+<tbody>
+<tr><td>裸 <code>new</code> / <code>new[]</code></td><td>✅ 会漏（delete 被跳过）</td><td>堆</td><td>你手写 delete</td></tr>
+<tr><td><code>std::unique_ptr</code></td><td>❌ 不漏</td><td>堆（智能指针对象在栈）</td><td>智能指针析构</td></tr>
+<tr><td><code>std::vector</code></td><td>❌ 不漏</td><td>堆（内部数组）</td><td>vector 析构</td></tr>
+</tbody></table>
+<p><img src="notes/w4-d3-raii.png" alt="D3 仅 1 块泄漏 = Part A，B/C 干净"></p>
+<p>标出「退出仅 1 块泄漏 = Part A 的 hp=1，B/C 干净」——全程序只有一个 12 字节块，正好证明 unique_ptr/vector 那段没漏。</p>
+<hr>
+<h2>5. 一周串起来：从「手动 delete」到「编译器替你 delete」</h2>
+<p><strong>事实</strong>：三天是一条线，不是三块拼盘——</p>
+<p>- D1：裸 <code>new/delete</code> → 会<strong>漏</strong>（忘了还 / 提前 return 跳过）。</p>
+<p>- D2：<code>new[]/delete[]</code> 配对 → 会<strong>配错</strong>（少了 <code>[]</code> 直接崩）；又学了 placement new（最易错，要手写析构、不能 delete）。</p>
+<p>- D3：RAII / <code>unique_ptr</code> / <code>vector</code> → 把「释放」<strong>焊死在对象析构上</strong>，编译器保证执行，提前 return、异常都逃不掉。</p>
+<p>一句话：工程里<strong>默认用 <code>unique_ptr</code> / <code>vector</code></strong>，裸 <code>new</code> 只在你必须手写底层（比如自己实现读取器内核、对象池）时才用，而且那种地方也要立刻用 RAII 包起来。</p>
+<p><strong>我的话</strong>（你 D4 修正版，已到位 ✅）：这周认知升级在于：以前以为 new/delete 配对好就万事大吉，现在知道手写 delete 会漏、会跳过、会配错，所以能交给编译器管的（unique_ptr/vector）绝不自己手写，把「释放」焊死在对象析构上才靠谱。</p>
+<hr>
+<h2>6. 和游戏安全有啥关系</h2>
+<p><strong>事实 + 引导</strong>（这节是灵魂，每点先给事实，后面「我的话」用你自己的话收）：</p>
+<ul>
+<li><strong>（1）你写的工具默认 RAII</strong>：以后写外部读取器 / 内存扫描器 / 特征匹配器，凡是碰堆的地方一律 <code>unique_ptr</code> / <code>vector</code>。少写一行 <code>delete</code>，就少一个通宵调泄漏的夜。<code>vector&lt;byte&gt;</code> 装读出来的内存块、<code>unique_ptr&lt;ProcessHandle&gt;</code> 管进程句柄，比手写 <code>new[]/delete[]</code> 稳得多。</li>
+</ul>
+<p><strong>我的话</strong>（你 D4 填的原话）：手写 <code>delete</code> 有可能在某些情况（提前 return、异常）下根本不执行，结果内存泄漏——因为 <code>p</code> 是局部变量，函数一结束指针就没了，但堆内存还在，又没别处存这个地址，这块内存就永久泄漏了。好比你请了个侦探来查谁偷了东西，结果侦探一进门就自己摔晕了（<code>delete</code> 没跑成），东西（内存）就一直丢着。所以能交给编译器管的（<code>unique_ptr</code>/<code>vector</code>）绝不自己手写 <code>delete</code>，这就是「少写 delete 少熬夜」。</p>
+<ul>
+<li><strong>（2）逆向看代码基本功</strong>：逆向别人/目标程序的模块时，看到裸 <code>new</code> 没配 <code>delete</code>，一眼判「这有泄漏 bug」；看到 <code>unique_ptr</code> / <code>vector</code> 知道这段 RAII 安全、析构会被自动调。这是读反汇编/源码的基本功——W4D3 你练的「读泄漏报告里 <code>Data: 01 00 00 00</code> 反推对象」就是这基本功的雏形。</li>
+</ul>
+<p><strong>我的话</strong>（你 D4 填的原话）：裸 <code>new</code> 没 <code>delete</code> = 你租了柜子、拿了钥匙，然后人走了钥匙也没还。那个柜子就一直锁着，别人用不了、你也拿不回——这就是内存泄漏。所以逆向看到别人代码裸 <code>new</code> 没配 <code>delete</code>，等于看到有人租了柜子拿了钥匙走人，一眼就知道这柜子（内存）漏了。</p>
+<ul>
+<li><strong>（3）异常安全</strong>：读目标进程时可能随时失败（进程崩了、权限不够、地址无效）。RAII 保证：哪怕中途抛异常，已分配的内存/句柄也自动回收，不会把你的辅助工具自己搞崩。</li>
+</ul>
+<p><strong>我的话</strong>（你 D4 填的原话）：你请了个保安（内存检测工具，比如 Valgrind、AddressSanitizer）来帮你抓小偷（内存泄漏）。结果保安自己先晕倒了——意思是：如果你的辅助工具/检测手段自己先崩了，就没人帮你抓泄漏了。所以读目标进程失败/崩了时，RAII 保证已分配的内存自动回收，不会让你的工具自己先「晕倒」。</p>
+<ul>
+<li><strong>（4）对象池 / 缓冲管理</strong>：要管一大块自己申请的内存（比如缓存一堆玩家结构体），用 <code>vector</code> / <code>unique_ptr</code> 接管，比手写 <code>new[]/delete[]</code> 不容易配错，扩容也交给 <code>vector</code>。</li>
+</ul>
+<p><strong>我的话</strong>（你 D4 填的原话）：用 <code>vector</code>/<code>unique_ptr</code> 管一大块内存比手写 <code>new[]</code>/<code>delete[]</code> 稳。</p>
+<hr>
+<h2>7. 发布</h2>
+<p>- 本笔记源码在 <code>notes/w4-memory-mgmt-note.md</code>，已转 HTML 发布于本站（<code>w4-memory-mgmt-note.html</code>）。</p>
+<p>- 配套代码：<code>code/04-heap-leak</code>、<code>code/05-array-placement</code>、<code>code/06-raii-smartptr</code>（见 GitHub 仓库）。</p>
+<p>- 博客站：<a href="https://weiyang-xxx.github.io/game-security-notes/">https://weiyang-xxx.github.io/game-security-notes/</a></p>
+<p>- 注意：公开仓库的 <code>.gitignore</code> 已挡 <code>.workbuddy/</code> 与编译产物 <code>*.obj</code>/<code>*.exe</code>，发布时别 <code>git add .</code> 整目录。</p>
+</body>
+</html>
